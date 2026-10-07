@@ -1388,8 +1388,23 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// HealthResponse reports process liveness plus WhatsApp connection state.
+// "success" stays true as long as the process is serving (existing callers
+// like ensure-bridge.sh only check that field); "connected"/"logged_in"/
+// "reconnecting" tell whether message ingest is actually flowing or a
+// reconnect is in progress.
+type HealthResponse struct {
+	Success              bool   `json:"success"`
+	Connected            bool   `json:"connected"`
+	LoggedIn             bool   `json:"logged_in"`
+	Reconnecting         bool   `json:"reconnecting"`
+	LoggedOut            bool   `json:"logged_out,omitempty"`
+	LastDisconnectReason string `json:"last_disconnect_reason,omitempty"`
+	LastDisconnectTime   string `json:"last_disconnect_time,omitempty"`
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) error {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, supervisor *connectionSupervisor, port int) error {
 	token := bridgeToken()
 	if token == "" {
 		return fmt.Errorf("WHATSAPP_BRIDGE_TOKEN is required")
@@ -1405,8 +1420,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		if !authorizeBridgeRequest(w, r, token) {
 			return
 		}
+		status := supervisor.Status()
+		resp := HealthResponse{
+			Success:              true,
+			Connected:            client.IsConnected(),
+			LoggedIn:             client.IsLoggedIn(),
+			Reconnecting:         status.Reconnecting,
+			LoggedOut:            status.LoggedOut,
+			LastDisconnectReason: status.LastDisconnect,
+		}
+		if !status.LastDisconnectAt.IsZero() {
+			resp.LastDisconnectTime = status.LastDisconnectAt.Format(time.RFC3339)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		json.NewEncoder(w).Encode(resp)
 	})
 
 	// Handler for sending messages
@@ -1893,6 +1920,10 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Supervisor that reconnects after disconnects whatsmeow does not recover
+	// from on its own (StreamReplaced, ClientOutdated, ConnectFailure, ...).
+	supervisor := newConnectionSupervisor(client, logger)
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		defer func() {
@@ -1912,9 +1943,42 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			supervisor.NoteConnected()
+
+		case *events.Disconnected:
+			// whatsmeow dispatches this only for unexpected disconnects and
+			// auto-reconnects on its own; the supervisor watchdog is the
+			// backstop if that fails.
+			logger.Warnf("Disconnected from WhatsApp; whatsmeow will auto-reconnect")
+
+		case *events.StreamReplaced:
+			// whatsmeow treats the disconnect that follows as expected and
+			// never reconnects, which used to freeze ingest while /api/health
+			// kept returning 200. Reconnect with the existing session.
+			logger.Warnf("WhatsApp stream replaced by another session with the same keys; reconnecting")
+			supervisor.NoteDisconnect("stream replaced")
+
+		case *events.ClientOutdated:
+			logger.Errorf("WhatsApp rejected the connection: client outdated (405). Retrying with backoff, but the bridge likely needs a whatsmeow upgrade and rebuild")
+			supervisor.NoteDisconnect("client outdated (405)")
+
+		case *events.TemporaryBan:
+			logger.Warnf("WhatsApp temporary ban (code=%d, expires in %v); reconnect attempts will back off", int(v.Code), v.Expire)
+			supervisor.NoteDisconnect(fmt.Sprintf("temporary ban (code=%d)", int(v.Code)))
+
+		case *events.ConnectFailure:
+			logger.Warnf("WhatsApp connect failure (reason=%d, message=%q); reconnecting", int(v.Reason), v.Message)
+			supervisor.NoteDisconnect(fmt.Sprintf("connect failure (reason=%d)", int(v.Reason)))
+
+		case *events.StreamError:
+			logger.Warnf("WhatsApp stream error (code=%s)", v.Code)
+
+		case *events.KeepAliveTimeout:
+			logger.Warnf("WhatsApp keepalive timeout (error_count=%d, last_success=%s)", v.ErrorCount, v.LastSuccess.Format(time.RFC3339))
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out by WhatsApp (on_connect=%t, reason=%s). Please scan QR code to log in again", v.OnConnect, v.Reason.String())
+			supervisor.NoteLoggedOut()
 		}
 	})
 
@@ -1975,8 +2039,11 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	// Keep the connection alive from here on.
+	go supervisor.Run()
+
 	// Start REST API server
-	if err := startRESTServer(client, messageStore, bridgePort()); err != nil {
+	if err := startRESTServer(client, messageStore, supervisor, bridgePort()); err != nil {
 		logger.Errorf("Failed to start REST API server: %v", err)
 		return
 	}

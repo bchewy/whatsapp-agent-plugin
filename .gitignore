@@ -26,3 +26,6 @@ dist/
 *.ogg.tmp
 .DS_Store
 .playwright-mcp/
+
+# Compiled bridge binary (built locally by start-bridge.sh / go build).
+whatsapp/build/vendor/whatsapp-mcp/whatsapp-bridge/whatsapp-client
