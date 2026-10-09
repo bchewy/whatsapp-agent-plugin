@@ -1403,6 +1403,9 @@ type HealthResponse struct {
 	LastDisconnectTime   string `json:"last_disconnect_time,omitempty"`
 }
 
+// Kept well under ensure-bridge.sh's 0.5s health-check timeout.
+const healthProbeTimeout = 200 * time.Millisecond
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, supervisor *connectionSupervisor, port int) error {
 	token := bridgeToken()
@@ -1421,11 +1424,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, super
 			return
 		}
 		status := supervisor.Status()
+		connected, probed := probeConnected(client, healthProbeTimeout)
 		resp := HealthResponse{
-			Success:              true,
-			Connected:            client.IsConnected(),
-			LoggedIn:             client.IsLoggedIn(),
-			Reconnecting:         status.Reconnecting,
+			Success:   true,
+			Connected: connected,
+			// whatsmeow only clears its logged-in flag on stream errors, so
+			// after a plain socket drop IsLoggedIn() stays true.
+			LoggedIn:             connected && client.IsLoggedIn(),
+			Reconnecting:         status.Reconnecting || !probed,
 			LoggedOut:            status.LoggedOut,
 			LastDisconnectReason: status.LastDisconnect,
 		}
@@ -1950,6 +1956,7 @@ func main() {
 			// auto-reconnects on its own; the supervisor watchdog is the
 			// backstop if that fails.
 			logger.Warnf("Disconnected from WhatsApp; whatsmeow will auto-reconnect")
+			supervisor.NoteAutoReconnecting("connection lost")
 
 		case *events.StreamReplaced:
 			// whatsmeow treats the disconnect that follows as expected and
@@ -1963,8 +1970,8 @@ func main() {
 			supervisor.NoteDisconnect("client outdated (405)")
 
 		case *events.TemporaryBan:
-			logger.Warnf("WhatsApp temporary ban (code=%d, expires in %v); reconnect attempts will back off", int(v.Code), v.Expire)
-			supervisor.NoteDisconnect(fmt.Sprintf("temporary ban (code=%d)", int(v.Code)))
+			logger.Warnf("WhatsApp temporary ban (code=%d, expires in %v); not reconnecting before it expires", int(v.Code), v.Expire)
+			supervisor.NoteDisconnectUntil(fmt.Sprintf("temporary ban (code=%d)", int(v.Code)), time.Now().Add(v.Expire))
 
 		case *events.ConnectFailure:
 			logger.Warnf("WhatsApp connect failure (reason=%d, message=%q); reconnecting", int(v.Reason), v.Message)
@@ -2058,7 +2065,7 @@ func main() {
 	<-exitChan
 
 	fmt.Println("Disconnecting...")
-	// Disconnect client
+	supervisor.Stop()
 	client.Disconnect()
 }
 
