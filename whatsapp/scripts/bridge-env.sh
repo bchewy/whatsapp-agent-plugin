@@ -4,6 +4,7 @@ set -euo pipefail
 # Shared runtime environment for the Go bridge and Python MCP server.
 export WHATSAPP_MCP_STORE_DIR="${WHATSAPP_MCP_STORE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/codex-whatsapp-plugin/store}"
 export WHATSAPP_BRIDGE_PORT="${WHATSAPP_BRIDGE_PORT:-8080}"
+export WHATSAPP_BRIDGE_BIN="${WHATSAPP_BRIDGE_BIN:-${XDG_DATA_HOME:-$HOME/.local/share}/codex-whatsapp-plugin/bin/whatsapp-bridge}"
 
 umask 077
 mkdir -p -m 700 "$WHATSAPP_MCP_STORE_DIR"
