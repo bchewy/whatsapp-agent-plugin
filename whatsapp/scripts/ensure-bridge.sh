@@ -11,10 +11,13 @@ lock_dir="$cache_dir/bridge-start.lock"
 pid_file="$state_dir/bridge.pid"
 log_file="$state_dir/bridge.log"
 
-is_bridge_ready() {
+# Health states: 0 = connected to WhatsApp, 2 = bridge process alive but not
+# connected (it serves HTTP 503 with connection details), 1 = no response.
+bridge_health_state() {
   python3 - "$WHATSAPP_BRIDGE_PORT" "$WHATSAPP_BRIDGE_TOKEN" <<'PY' >/dev/null 2>&1
 import json
 import sys
+import urllib.error
 import urllib.request
 
 port, token = sys.argv[1], sys.argv[2]
@@ -23,11 +26,33 @@ request = urllib.request.Request(
     headers={"X-WhatsApp-Bridge-Token": token},
     method="GET",
 )
-with urllib.request.urlopen(request, timeout=0.5) as response:
-    body = json.loads(response.read().decode("utf-8"))
-    if response.status != 200 or body.get("success") is not True:
-        raise SystemExit(1)
+try:
+    with urllib.request.urlopen(request, timeout=0.5) as response:
+        body = json.loads(response.read().decode("utf-8"))
+except urllib.error.HTTPError as err:
+    if err.code == 503:
+        try:
+            json.loads(err.read().decode("utf-8"))
+        except Exception:
+            raise SystemExit(1)
+        raise SystemExit(2)
+    raise SystemExit(1)
+except Exception:
+    raise SystemExit(1)
+if body.get("success") is True:
+    raise SystemExit(0)
+raise SystemExit(2 if "connected" in body else 1)
 PY
+}
+
+is_bridge_ready() {
+  bridge_health_state
+}
+
+# True if any bridge process is running (port listener, built binary, or
+# go run / go-build orphans), regardless of whether its API answers.
+bridge_process_running() {
+  bash "$script_dir/bridge-procs.sh" pids >/dev/null 2>&1
 }
 
 wait_for_bridge() {
@@ -42,7 +67,25 @@ wait_for_bridge() {
   return 1
 }
 
-if is_bridge_ready; then
+health_state=0
+bridge_health_state || health_state=$?
+
+if [ "$health_state" -eq 0 ]; then
+  exit 0
+fi
+
+if [ "$health_state" -eq 2 ]; then
+  # The bridge process is alive but disconnected from WhatsApp (e.g. client
+  # outdated 405, stream replaced). Starting a second bridge on the same
+  # session would make things worse; surface the state instead.
+  printf 'warn: WhatsApp bridge on 127.0.0.1:%s is running but NOT connected to WhatsApp. Check GET /api/health last_error; if the client is outdated, rebuild with scripts/build-bridge.sh and restart the bridge.\n' "$WHATSAPP_BRIDGE_PORT" >&2
+  exit 0
+fi
+
+if bridge_process_running; then
+  # A bridge (or an orphaned go-run child) exists but its API is unresponsive.
+  # It likely still holds the port, so a new bridge could not bind anyway.
+  printf 'warn: a WhatsApp bridge process is already running but its API on 127.0.0.1:%s is unresponsive. Inspect with scripts/bridge-procs.sh list, stop it with scripts/bridge-procs.sh kill, then rerun.\n' "$WHATSAPP_BRIDGE_PORT" >&2
   exit 0
 fi
 
