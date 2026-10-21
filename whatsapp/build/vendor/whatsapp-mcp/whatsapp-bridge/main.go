@@ -1389,7 +1389,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) error {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, health *healthState, port int) error {
 	token := bridgeToken()
 	if token == "" {
 		return fmt.Errorf("WHATSAPP_BRIDGE_TOKEN is required")
@@ -1397,17 +1397,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if !authorizeBridgeRequest(w, r, token) {
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]bool{"success": true})
-	})
+	mux.HandleFunc("/api/health", healthHandler(health, token))
 
 	// Handler for sending messages
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
@@ -1893,6 +1883,11 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Track the real connection state for /api/health, independent of the
+	// message-ingest handler below.
+	health := newHealthState()
+	client.AddEventHandler(health.HandleEvent)
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		defer func() {
@@ -1976,7 +1971,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	if err := startRESTServer(client, messageStore, bridgePort()); err != nil {
+	if err := startRESTServer(client, messageStore, health, bridgePort()); err != nil {
 		logger.Errorf("Failed to start REST API server: %v", err)
 		return
 	}
