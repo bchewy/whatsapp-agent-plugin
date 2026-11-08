@@ -437,7 +437,7 @@ Local marketplace registration lives outside this repo in
 - `whatsapp/.mcp.json`: Codex MCP server entry for WhatsApp.
 - `whatsapp/assets/icon.svg`: WhatsApp logo used in the composer and plugin UI.
 - `whatsapp/skills/whatsapp/SKILL.md`: workflow guidance for the agent.
-- `whatsapp/scripts/`: setup, health, bridge, and reset helpers.
+- `whatsapp/scripts/`: setup, health, bridge, watchdog, and reset helpers.
 - `whatsapp/build/vendor/whatsapp-mcp/`: vendored upstream WhatsApp bridge and
   MCP server.
 - `tests/whatsapp_plugin/`: structure tests that validate the portable
@@ -513,6 +513,19 @@ bash whatsapp/scripts/bridge-service.sh uninstall
 The MCP startup script also tries to auto-start the bridge in the background
 when the client starts the WhatsApp MCP server. Set
 `WHATSAPP_BRIDGE_AUTO_START=0` to disable that behavior.
+
+For an always-on box, `whatsapp/scripts/watchdog.sh` can run periodically
+(cron) to restart the bridge when it is actually wedged. It restarts when the
+process or `/api/health` is down, and when `messages.db` has not changed for
+20+ minutes (`WHATSAPP_WATCHDOG_SIGNAL_STALE_SEC`, default 1200) **and** the
+post-restart bridge log contains a socket-death signal — matched
+case-insensitively, including whatsmeow's live wording `Keepalive timed out`
+and `failed to acquire lock: context deadline exceeded`, plus
+`StreamReplaced` and `Client outdated (405)`. Staleness alone never restarts
+(a quiet chat is not an outage), and a grace window
+(`WHATSAPP_WATCHDOG_GRACE_SEC`, default 600) protects a freshly restarted
+bridge. All kills go through `bridge-procs.sh`, so an unrelated process is
+never killed and a second bridge is never started against the same session.
 
 Logs are written under:
 
